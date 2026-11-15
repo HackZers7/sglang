@@ -210,7 +210,16 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     param_names_mapping = _PARAM_NAMES_MAPPING
     # Comfy packs the vision tower across whole tensors rather than rows. Keep
     # its language/vocabulary matrices packed and restore this smaller tower.
-    gguf_dequantize_prefixes = ("visual.", "model.visual.")
+    # GGUF exports of this encoder (e.g. DeepBeepMeep/MiniMax-H3) quantize
+    # model.embed_tokens, but the native VocabParallelEmbedding has no packed
+    # GGUF path, so restore the embedding to BF16 on load instead of leaving
+    # its quantization marker unconsumed.
+    gguf_dequantize_prefixes = (
+        "visual.",
+        "model.visual.",
+        "model.embed_tokens.",
+        "model.language_model.embed_tokens.",
+    )
 
     @classmethod
     def configure_component_paths(

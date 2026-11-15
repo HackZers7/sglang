@@ -178,7 +178,7 @@ def _host_resident_tables(model: torch.nn.Module) -> List[torch.nn.Module]:
 
 def detach_host_resident_tables(
     model: torch.nn.Module,
-) -> List[Tuple[torch.nn.Module, torch.Tensor]]:
+) -> List[Tuple[torch.nn.Module, List[Tuple[torch.Tensor, torch.Tensor]]]]:
     """Park large vocab tables on the host so a `.to(device)` skips them."""
     detached = []
     for module in _host_resident_tables(model):
@@ -188,23 +188,38 @@ def detach_host_resident_tables(
         # below always sends indices to the host, so retaining accelerator data
         # here would restore a CUDA weight and create a CPU-index/CUDA-weight
         # mismatch in the embedding gather.
-        detached.append((module, weight.data.to("cpu")))
+        entries = [(weight, weight.data.to("cpu"))]
         weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+        # A quantized table carries its dequantization state (e.g. ComfyInt8's
+        # weight_scale) as sibling parameters or buffers of the same module.
+        # The gather hooks run the module's whole forward on the host, so that
+        # state must be parked on the host too; leaving it on the accelerator
+        # mixes devices inside the lookup.
+        for _, tensor in list(module.named_parameters(recurse=False)) + list(
+            module.named_buffers(recurse=False)
+        ):
+            if tensor is weight:
+                continue
+            entries.append((tensor, tensor.data.to("cpu")))
+            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+        detached.append((module, entries))
     return detached
 
 
 def restore_host_resident_tables(
-    detached: List[Tuple[torch.nn.Module, torch.Tensor]],
+    detached: List[Tuple[torch.nn.Module, List[Tuple[torch.Tensor, torch.Tensor]]]],
     device: torch.device | str,
 ) -> None:
-    for module, data in detached:
-        module.weight.data = data
+    for module, entries in detached:
+        for tensor, data in entries:
+            tensor.data = data
         _install_host_gather_hooks(module, device)
         logger.info(
             "Keeping %s (%.2f GiB) in host memory: a gather reads one row per "
             "token, so residency buys almost nothing.",
             type(module).__name__,
-            data.numel() * data.element_size() / (1024**3),
+            sum(data.numel() * data.element_size() for _, data in entries)
+            / (1024**3),
         )
 
 

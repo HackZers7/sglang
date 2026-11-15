@@ -24,6 +24,30 @@ class _Declared(torch.nn.Module):
         self.proj = torch.nn.Linear(dim, dim)
 
 
+class _QuantizedTable(torch.nn.Module):
+    """An embedding table with ComfyInt8-style dequantization state."""
+
+    def __init__(self, num_embeddings: int = 4096, dim: int = 64):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.randn(num_embeddings, dim), requires_grad=False
+        )
+        self.weight_scale = torch.nn.Parameter(
+            torch.tensor(0.5), requires_grad=False
+        )
+
+    def forward(self, ids):
+        return torch.nn.functional.embedding(ids, self.weight) * self.weight_scale
+
+
+class _QuantizedDeclared(torch.nn.Module):
+    host_resident_table_names = ["embed"]
+
+    def __init__(self):
+        super().__init__()
+        self.embed = _QuantizedTable()
+
+
 class _Undeclared(torch.nn.Module):
     def __init__(self, num_embeddings: int = 4096, dim: int = 64):
         super().__init__()
@@ -124,4 +148,26 @@ class TestDetachAndRestore:
             actual = model.embed(ids)
         assert model.embed.weight.device.type == "cpu"
         assert actual.device.type == "cuda"
+        assert torch.equal(actual, expected)
+
+    def test_quantized_table_state_stays_with_the_weight(self):
+        # ComfyInt8-style tables keep a weight_scale next to the weight; the
+        # host gather runs the whole forward on the host, so parking only the
+        # weight would mix devices inside the lookup.
+        model = _QuantizedDeclared()
+        ids = torch.tensor([[1, 2], [3, 4]])
+        with torch.no_grad():
+            expected = model.embed(ids)
+
+        with patch(THRESHOLD_PATH, 1024):
+            detached = detach_host_resident_tables(model)
+            assert model.embed.weight.numel() == 0
+            assert model.embed.weight_scale.numel() == 0
+            model.to("cpu")
+            restore_host_resident_tables(detached, "cpu")
+
+        assert model.embed.weight.device.type == "cpu"
+        assert model.embed.weight_scale.device.type == "cpu"
+        with torch.no_grad():
+            actual = model.embed(ids)
         assert torch.equal(actual, expected)
